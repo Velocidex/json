@@ -391,7 +391,7 @@ type EncOpts struct {
 
 var EncoderCallbackSkip error = errors.New("Skip")
 
-type EncoderCallback func(t interface{}) ([]byte, error)
+type EncoderCallback func(t interface{}, opts *EncOpts) ([]byte, error)
 
 func NewEncOpts() *EncOpts {
 	return &EncOpts{
@@ -525,7 +525,7 @@ func callbackEncoder(e *encodeState, v reflect.Value, opts *EncOpts) {
 		return
 	}
 
-	b, err := cb(v.Interface())
+	b, err := cb(v.Interface(), opts)
 	if err == nil {
 		// copy JSON into buffer, checking validity.
 		err = compact(&e.Buffer, b, opts.escapeHTML)
