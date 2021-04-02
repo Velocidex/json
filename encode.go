@@ -364,7 +364,31 @@ func isEmptyValue(v reflect.Value) bool {
 		return v.Float() == 0
 	case reflect.Interface, reflect.Ptr:
 		return v.IsNil()
+
+	case reflect.Struct:
+		if v.Kind() == reflect.Ptr {
+			v = v.Elem()
+		}
+
+		vt := v.Type()
+		for i := v.NumField() - 1; i >= 0; i-- {
+			if vt.Field(i).PkgPath != "" {
+				continue // Private field
+			}
+
+			vf := v.Field(i)
+			if vf.Kind() == reflect.Ptr {
+				vf = vf.Elem()
+			}
+
+			if !isEmptyValue(vf) {
+				return false
+			}
+		}
+		return true
+
 	}
+
 	return false
 }
 
@@ -384,6 +408,9 @@ type EncOpts struct {
 	fieldCache   sync.Map // map[reflect.Type]structFields
 	encoderCache sync.Map // map[reflect.Type]encoderFunc
 
+	// Omits empty structs
+	omitEmptyStructs bool
+
 	// Hooks allowing the caller to create custom encoders for
 	// different types.
 	callbacks map[reflect.Type]EncoderCallback
@@ -402,6 +429,11 @@ func NewEncOpts() *EncOpts {
 
 func (e *EncOpts) WithCallback(v interface{}, cb EncoderCallback) *EncOpts {
 	e.callbacks[reflect.TypeOf(v)] = cb
+	return e
+}
+
+func (e *EncOpts) WithOmitEmptyStructs() *EncOpts {
+	e.omitEmptyStructs = true
 	return e
 }
 
@@ -811,9 +843,17 @@ FieldLoop:
 				if fv.IsNil() {
 					continue FieldLoop
 				}
+
 				fv = fv.Elem()
 			}
 			fv = fv.Field(i)
+
+			if opts.omitEmptyStructs {
+				if fv.Kind() == reflect.Ptr &&
+					isEmptyValue(fv.Elem()) {
+					continue FieldLoop
+				}
+			}
 		}
 
 		if f.omitEmpty && isEmptyValue(fv) {
