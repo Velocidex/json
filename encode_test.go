@@ -14,7 +14,6 @@ import (
 	"regexp"
 	"strconv"
 	"testing"
-	"time"
 	"unicode"
 )
 
@@ -80,37 +79,66 @@ type StringTag struct {
 	NumberStr  Number  `json:",string"`
 }
 
-var stringTagExpected = `{
- "BoolStr": "true",
- "IntStr": "42",
- "UintptrStr": "44",
- "StrStr": "\"xzbit\"",
- "NumberStr": "46"
-}`
+func TestRoundtripStringTag(t *testing.T) {
+	tests := []struct {
+		name string
+		in   StringTag
+		want string // empty to just test that we roundtrip
+	}{
+		{
+			name: "AllTypes",
+			in: StringTag{
+				BoolStr:    true,
+				IntStr:     42,
+				UintptrStr: 44,
+				StrStr:     "xzbit",
+				NumberStr:  "46",
+			},
+			want: `{
+				"BoolStr": "true",
+				"IntStr": "42",
+				"UintptrStr": "44",
+				"StrStr": "\"xzbit\"",
+				"NumberStr": "46"
+			}`,
+		},
+		{
+			// See golang.org/issues/38173.
+			name: "StringDoubleEscapes",
+			in: StringTag{
+				StrStr:    "\b\f\n\r\t\"\\",
+				NumberStr: "0", // just to satisfy the roundtrip
+			},
+			want: `{
+				"BoolStr": "false",
+				"IntStr": "0",
+				"UintptrStr": "0",
+				"StrStr": "\"\\u0008\\u000c\\n\\r\\t\\\"\\\\\"",
+				"NumberStr": "0"
+			}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Indent with a tab prefix to make the multi-line string
+			// literals in the table nicer to read.
+			got, err := MarshalIndent(&test.in, "\t\t\t", "\t")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(got); got != test.want {
+				t.Fatalf(" got: %s\nwant: %s\n", got, test.want)
+			}
 
-func TestStringTag(t *testing.T) {
-	var s StringTag
-	s.BoolStr = true
-	s.IntStr = 42
-	s.UintptrStr = 44
-	s.StrStr = "xzbit"
-	s.NumberStr = "46"
-	got, err := MarshalIndent(&s, "", " ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := string(got); got != stringTagExpected {
-		t.Fatalf(" got: %s\nwant: %s\n", got, stringTagExpected)
-	}
-
-	// Verify that it round-trips.
-	var s2 StringTag
-	err = NewDecoder(bytes.NewReader(got)).Decode(&s2)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if !reflect.DeepEqual(s, s2) {
-		t.Fatalf("decode didn't match.\nsource: %#v\nEncoded as:\n%s\ndecode: %#v", s, string(got), s2)
+			// Verify that it round-trips.
+			var s2 StringTag
+			if err := Unmarshal(got, &s2); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if !reflect.DeepEqual(test.in, s2) {
+				t.Fatalf("decode didn't match.\nsource: %#v\nEncoded as:\n%s\ndecode: %#v", test.in, string(got), s2)
+			}
+		})
 	}
 }
 
@@ -155,7 +183,15 @@ type PointerCycleIndirect struct {
 	Ptrs []interface{}
 }
 
-var pointerCycleIndirect = &PointerCycleIndirect{}
+type RecursiveSlice []RecursiveSlice
+
+var (
+	pointerCycleIndirect = &PointerCycleIndirect{}
+	mapCycle             = make(map[string]interface{})
+	sliceCycle           = []interface{}{nil}
+	sliceNoCycle         = []interface{}{nil, nil}
+	recursiveSliceCycle  = []RecursiveSlice{nil}
+)
 
 func init() {
 	ptr := &SamePointerNoCycle{}
@@ -164,10 +200,24 @@ func init() {
 
 	pointerCycle.Ptr = pointerCycle
 	pointerCycleIndirect.Ptrs = []interface{}{pointerCycleIndirect}
+
+	mapCycle["x"] = mapCycle
+	sliceCycle[0] = sliceCycle
+	sliceNoCycle[1] = sliceNoCycle[:1]
+	for i := startDetectingCyclesAfter; i > 0; i-- {
+		sliceNoCycle = []interface{}{sliceNoCycle}
+	}
+	recursiveSliceCycle[0] = recursiveSliceCycle
 }
 
 func TestSamePointerNoCycle(t *testing.T) {
 	if _, err := Marshal(samePointerNoCycle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSliceNoCycle(t *testing.T) {
+	if _, err := Marshal(sliceNoCycle); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -178,6 +228,9 @@ var unsupportedValues = []interface{}{
 	math.Inf(1),
 	pointerCycle,
 	pointerCycleIndirect,
+	mapCycle,
+	sliceCycle,
+	recursiveSliceCycle,
 }
 
 func TestUnsupportedValues(t *testing.T) {
@@ -189,6 +242,22 @@ func TestUnsupportedValues(t *testing.T) {
 		} else {
 			t.Errorf("for %v, expected error", v)
 		}
+	}
+}
+
+// Issue 43207
+func TestMarshalTextFloatMap(t *testing.T) {
+	m := map[textfloat]string{
+		textfloat(math.NaN()): "1",
+		textfloat(math.NaN()): "1",
+	}
+	got, err := Marshal(m)
+	if err != nil {
+		t.Errorf("Marshal() error: %v", err)
+	}
+	want := `{"TF:NaN":"1","TF:NaN":"1"}`
+	if string(got) != want {
+		t.Errorf("Marshal() = %s, want %s", got, want)
 	}
 }
 
@@ -801,6 +870,10 @@ func tenc(format string, a ...interface{}) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+type textfloat float64
+
+func (f textfloat) MarshalText() ([]byte, error) { return tenc(`TF:%0.2f`, f) }
+
 // Issue 13783
 func TestEncodeBytekind(t *testing.T) {
 	testdata := []struct {
@@ -819,6 +892,7 @@ func TestEncodeBytekind(t *testing.T) {
 		{[]jsonint{5, 4}, `[{"JI":5},{"JI":4}]`},
 		{[]textint{9, 3}, `["TI:9","TI:3"]`},
 		{[]int{9, 3}, `[9,3]`},
+		{[]textfloat{12, 3}, `["TF:12.00","TF:3.00"]`},
 	}
 	for _, d := range testdata {
 		js, err := Marshal(d.data)
@@ -1125,34 +1199,5 @@ func TestMarshalerError(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("MarshalerError test %d, got: %s, want: %s", i, got, tt.want)
 		}
-	}
-}
-
-type MarshalWithOptionsTestStruct struct {
-	A int
-	B time.Time
-}
-
-func TestMarshalWithOptions(t *testing.T) {
-	m := &MarshalWithOptionsTestStruct{A: 5, B: time.Now()}
-
-	cb := func(v interface{}) ([]byte, error) {
-		switch v.(type) {
-		case time.Time:
-			return []byte("\"Specialized Time\""), nil
-		}
-		return nil, EncoderCallbackSkip
-	}
-
-	// Any time.Time encountered will fire into the callback.
-	serialized, err := MarshalWithOptions(
-		m, NewEncOpts().WithCallback(time.Time{}, cb))
-	if err != nil {
-		t.Errorf("Serialize error: %v", err)
-	}
-	got := string(serialized)
-	want := `{"A":5,"B":"Specialized Time"}`
-	if got != want {
-		t.Fatalf("Marshal: got %s want %s", got, want)
 	}
 }
