@@ -6,13 +6,12 @@ package json_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strings"
-
-	"github.com/Velocidex/json"
 )
 
 func ExampleMarshal() {
@@ -280,12 +279,12 @@ func ExampleMarshalIndent() {
 		"b": 2,
 	}
 
-	json, err := json.MarshalIndent(data, "<prefix>", "<indent>")
+	b, err := json.MarshalIndent(data, "<prefix>", "<indent>")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println(string(json))
+	fmt.Println(string(b))
 	// Output:
 	// {
 	// <prefix><indent>"a": 1,

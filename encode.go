@@ -250,6 +250,8 @@ func (e *UnsupportedTypeError) Error() string {
 	return "json: unsupported type: " + e.Type.String()
 }
 
+// An UnsupportedValueError is returned by Marshal when attempting
+// to encode an unsupported value.
 type UnsupportedValueError struct {
 	Value reflect.Value
 	Str   string
@@ -439,6 +441,8 @@ func (e *EncOpts) WithOmitEmptyStructs() *EncOpts {
 
 type encoderFunc func(e *encodeState, v reflect.Value, opts *EncOpts)
 
+var encoderCache sync.Map // map[reflect.Type]encoderFunc
+
 func valueEncoder(v reflect.Value, opts *EncOpts) encoderFunc {
 	if !v.IsValid() {
 		return invalidValueEncoder
@@ -488,9 +492,11 @@ func newTypeEncoder(
 	opts *EncOpts) encoderFunc {
 
 	// If callbacks are defined use them.
-	_, pres := opts.callbacks[t]
+	cb, pres := opts.callbacks[t]
 	if pres {
-		return callbackEncoder
+		return func(e *encodeState, v reflect.Value, opts *EncOpts) {
+			callbackEncoder(cb, e, v, opts)
+		}
 	}
 
 	// If we have a non-pointer value whose type implements
@@ -549,18 +555,16 @@ func invalidValueEncoder(e *encodeState, v reflect.Value, _ *EncOpts) {
 	e.WriteString("null")
 }
 
-func callbackEncoder(e *encodeState, v reflect.Value, opts *EncOpts) {
-	t := v.Type()
-	cb, pres := opts.callbacks[t]
-	if !pres {
-		e.WriteString("null")
-		return
-	}
-
+func callbackEncoder(
+	cb EncoderCallback, e *encodeState, v reflect.Value, opts *EncOpts) {
 	b, err := cb(v.Interface(), opts)
 	if err == nil {
-		// copy JSON into buffer, checking validity.
-		err = compact(&e.Buffer, b, opts.escapeHTML)
+		// copy JSON into buffer, checking validity.  This seems to be
+		// extremely slow... we trust that custom encoders are doing
+		// the right thing.
+
+		// err = compact(&e.Buffer, b, opts.escapeHTML)
+		e.WriteString(string(b))
 	}
 	if err != nil {
 		e.error(&MarshalerError{v.Type(), err, "MarshalJSON"})
@@ -572,7 +576,6 @@ func marshalerEncoder(e *encodeState, v reflect.Value, opts *EncOpts) {
 		e.WriteString("null")
 		return
 	}
-
 	m, ok := v.Interface().(Marshaler)
 	if !ok {
 		e.WriteString("null")
@@ -739,11 +742,12 @@ func stringEncoder(e *encodeState, v reflect.Value, opts *EncOpts) {
 		return
 	}
 	if opts.quoted {
-		b := make([]byte, 0, v.Len()+2)
-		b = append(b, '"')
-		b = append(b, []byte(v.String())...)
-		b = append(b, '"')
-		e.stringBytes(b, opts.escapeHTML)
+		e2 := newEncodeState()
+		// Since we encode the string twice, we only need to escape HTML
+		// the first time.
+		e2.string(v.String(), opts.escapeHTML)
+		e.stringBytes(e2.Bytes(), false)
+		encodeStatePool.Put(e2)
 	} else {
 		e.string(v.String(), opts.escapeHTML)
 	}
@@ -753,7 +757,7 @@ func stringEncoder(e *encodeState, v reflect.Value, opts *EncOpts) {
 func isValidNumber(s string) bool {
 	// This function implements the JSON numbers grammar.
 	// See https://tools.ietf.org/html/rfc7159#section-6
-	// and https://json.org/number.gif
+	// and https://www.json.org/img/number.png
 
 	if s == "" {
 		return false
@@ -843,7 +847,6 @@ FieldLoop:
 				if fv.IsNil() {
 					continue FieldLoop
 				}
-
 				fv = fv.Elem()
 			}
 			fv = fv.Field(i)
@@ -854,6 +857,7 @@ FieldLoop:
 					continue FieldLoop
 				}
 			}
+
 		}
 
 		if f.omitEmpty && isEmptyValue(fv) {
@@ -890,28 +894,40 @@ func (me mapEncoder) encode(e *encodeState, v reflect.Value, opts *EncOpts) {
 		e.WriteString("null")
 		return
 	}
+	if e.ptrLevel++; e.ptrLevel > startDetectingCyclesAfter {
+		// We're a large number of nested ptrEncoder.encode calls deep;
+		// start checking if we've run into a pointer cycle.
+		ptr := v.Pointer()
+		if _, ok := e.ptrSeen[ptr]; ok {
+			e.error(&UnsupportedValueError{v, fmt.Sprintf("encountered a cycle via %s", v.Type())})
+		}
+		e.ptrSeen[ptr] = struct{}{}
+		defer delete(e.ptrSeen, ptr)
+	}
 	e.WriteByte('{')
 
 	// Extract and sort the keys.
-	keys := v.MapKeys()
-	sv := make([]reflectWithString, len(keys))
-	for i, v := range keys {
-		sv[i].v = v
+	sv := make([]reflectWithString, v.Len())
+	mi := v.MapRange()
+	for i := 0; mi.Next(); i++ {
+		sv[i].k = mi.Key()
+		sv[i].v = mi.Value()
 		if err := sv[i].resolve(); err != nil {
 			e.error(fmt.Errorf("json: encoding error for type %q: %q", v.Type().String(), err.Error()))
 		}
 	}
-	sort.Slice(sv, func(i, j int) bool { return sv[i].s < sv[j].s })
+	sort.Slice(sv, func(i, j int) bool { return sv[i].ks < sv[j].ks })
 
 	for i, kv := range sv {
 		if i > 0 {
 			e.WriteByte(',')
 		}
-		e.string(kv.s, opts.escapeHTML)
+		e.string(kv.ks, opts.escapeHTML)
 		e.WriteByte(':')
-		me.elemEnc(e, v.MapIndex(kv.v), opts)
+		me.elemEnc(e, kv.v, opts)
 	}
 	e.WriteByte('}')
+	e.ptrLevel--
 }
 
 func newMapEncoder(t reflect.Type, opts *EncOpts) encoderFunc {
@@ -968,7 +984,23 @@ func (se sliceEncoder) encode(e *encodeState, v reflect.Value, opts *EncOpts) {
 		e.WriteString("null")
 		return
 	}
+	if e.ptrLevel++; e.ptrLevel > startDetectingCyclesAfter {
+		// We're a large number of nested ptrEncoder.encode calls deep;
+		// start checking if we've run into a pointer cycle.
+		// Here we use a struct to memorize the pointer to the first element of the slice
+		// and its length.
+		ptr := struct {
+			ptr uintptr
+			len int
+		}{v.Pointer(), v.Len()}
+		if _, ok := e.ptrSeen[ptr]; ok {
+			e.error(&UnsupportedValueError{v, fmt.Sprintf("encountered a cycle via %s", v.Type())})
+		}
+		e.ptrSeen[ptr] = struct{}{}
+		defer delete(e.ptrSeen, ptr)
+	}
 	se.arrayEnc(e, v, opts)
+	e.ptrLevel--
 }
 
 func newSliceEncoder(t reflect.Type, opts *EncOpts) encoderFunc {
@@ -1036,8 +1068,7 @@ type condAddrEncoder struct {
 	canAddrEnc, elseEnc encoderFunc
 }
 
-func (ce condAddrEncoder) encode(e *encodeState, v reflect.Value,
-	opts *EncOpts) {
+func (ce condAddrEncoder) encode(e *encodeState, v reflect.Value, opts *EncOpts) {
 	if v.CanAddr() {
 		ce.canAddrEnc(e, v, opts)
 	} else {
@@ -1058,7 +1089,7 @@ func isValidTag(s string) bool {
 	}
 	for _, c := range s {
 		switch {
-		case strings.ContainsRune("!#$%&()*+-./:<=>?@[]^_{|}~ ", c):
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
 			// Backslash and quote chars are reserved, but
 			// otherwise any punctuation chars are allowed
 			// in a tag name.
@@ -1080,29 +1111,30 @@ func typeByIndex(t reflect.Type, index []int) reflect.Type {
 }
 
 type reflectWithString struct {
-	v reflect.Value
-	s string
+	k  reflect.Value
+	v  reflect.Value
+	ks string
 }
 
 func (w *reflectWithString) resolve() error {
-	if w.v.Kind() == reflect.String {
-		w.s = w.v.String()
+	if w.k.Kind() == reflect.String {
+		w.ks = w.k.String()
 		return nil
 	}
-	if tm, ok := w.v.Interface().(encoding.TextMarshaler); ok {
-		if w.v.Kind() == reflect.Ptr && w.v.IsNil() {
+	if tm, ok := w.k.Interface().(encoding.TextMarshaler); ok {
+		if w.k.Kind() == reflect.Ptr && w.k.IsNil() {
 			return nil
 		}
 		buf, err := tm.MarshalText()
-		w.s = string(buf)
+		w.ks = string(buf)
 		return err
 	}
-	switch w.v.Kind() {
+	switch w.k.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		w.s = strconv.FormatInt(w.v.Int(), 10)
+		w.ks = strconv.FormatInt(w.k.Int(), 10)
 		return nil
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		w.s = strconv.FormatUint(w.v.Uint(), 10)
+		w.ks = strconv.FormatUint(w.k.Uint(), 10)
 		return nil
 	}
 	panic("unexpected map key type")
@@ -1322,19 +1354,18 @@ func typeFields(t reflect.Type, opts *EncOpts) structFields {
 			// Scan f.typ for fields to include.
 			for i := 0; i < f.typ.NumField(); i++ {
 				sf := f.typ.Field(i)
-				isUnexported := sf.PkgPath != ""
 				if sf.Anonymous {
 					t := sf.Type
 					if t.Kind() == reflect.Ptr {
 						t = t.Elem()
 					}
-					if isUnexported && t.Kind() != reflect.Struct {
+					if !sf.IsExported() && t.Kind() != reflect.Struct {
 						// Ignore embedded fields of unexported non-struct types.
 						continue
 					}
 					// Do not ignore embedded fields of unexported struct types
 					// since they may have exported fields.
-				} else if isUnexported {
+				} else if !sf.IsExported() {
 					// Ignore unexported non-embedded fields.
 					continue
 				}
@@ -1489,9 +1520,14 @@ func dominantField(fields []field) (field, bool) {
 	return fields[0], true
 }
 
+var fieldCache sync.Map // map[reflect.Type]structFields
+
 // cachedTypeFields is like typeFields but uses a cache to avoid repeated work.
 func cachedEncTypeFields(
 	t reflect.Type, opts *EncOpts) structFields {
+	if opts == nil {
+		opts = &EncOpts{}
+	}
 	if f, ok := opts.fieldCache.Load(t); ok {
 		return f.(structFields)
 	}
